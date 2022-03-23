@@ -89,12 +89,13 @@ public class DynamoDbClient {
     private static final CharSequence IN_DELIMITER = ",";
     private static final CharSequence IN_PREFIX = "(";
     private static final CharSequence IN_SUFFIX = ")";
+    private static final String POUND_SIGN = "#";
 
     /**
      * key：tableName
      * value： {@link DynamoDbTable}
      */
-    private static final Map<String, DynamoDbTable> tableMap = new ConcurrentHashMap<>();
+    private final Map<String, DynamoDbTable> tableMap = new ConcurrentHashMap<>();
 
     @Inject
     public DynamoDbClient(DynamoDbConfig dynamoDbConfig, AmazonDynamoDB dynamoDbClient, DynamoDBMapper dynamoDbMapper, DynamoDB dynamoDb) throws IOException {
@@ -186,11 +187,21 @@ public class DynamoDbClient {
     private ScanRequest buildScanRequest(DynamoDbTable table, Set<DynamoDbColumn> desiredColumns) {
         // 构建projection
         Set<String> projections = desiredColumns.stream().map(DynamoDbColumn::getOriginName).collect(Collectors.toSet());
-
         // 构建QueryRequest
         String originTableName = table.getOriginTableName();
         ScanRequest scanRequest = new ScanRequest();
-        scanRequest.withTableName(originTableName).withLimit(dynamoDbConfig.getLimit()).withProjectionExpression(String.join(",", projections));
+        scanRequest.withTableName(originTableName)
+                .withLimit(dynamoDbConfig.getLimit());
+
+        // 主要处理count(*)场景下projections为empty
+        if (projections.size() > 0) {
+            Map<String, String> expressionAttributeNames = new HashMap<>(projections.size());
+            projections.forEach(projection -> expressionAttributeNames.put(POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH)), projection));
+            scanRequest.withExpressionAttributeNames(expressionAttributeNames)
+                    .withProjectionExpression(projections.stream()
+                            .map(projection -> POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH)))
+                            .collect(Collectors.joining(IN_DELIMITER)));
+        }
         return scanRequest;
     }
 
@@ -219,11 +230,18 @@ public class DynamoDbClient {
 
         // 构建projection
         Set<String> projections = desiredColumns.stream().map(DynamoDbColumn::getOriginName).collect(Collectors.toSet());
+        Map<String, String> expressionAttributeNames = new HashMap<>(projections.size());
+        projections.forEach(projection -> expressionAttributeNames.put(POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH)), projection));
 
         // 构建QueryRequest
         String originTableName = table.getOriginTableName();
         QueryRequest queryRequest = new QueryRequest();
-        queryRequest.withTableName(originTableName).withLimit(dynamoDbConfig.getLimit()).withProjectionExpression(String.join(",", projections));
+        queryRequest.withTableName(originTableName)
+                .withLimit(dynamoDbConfig.getLimit())
+                .withProjectionExpression(projections.stream()
+                        .map(projection -> POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH)))
+                        .collect(Collectors.joining(IN_DELIMITER)))
+                .withExpressionAttributeNames(expressionAttributeNames);
 
         // 根据hashKey&rangeKey比对项找到最佳的查询入口
         String indexName = findBestMatchIndex(table, hashKeyCandidateFieldSet, rangeKeyCandidateFieldSet, allSingleConditionInfoMap, projections);
@@ -342,11 +360,12 @@ public class DynamoDbClient {
      */
     private String buildExpressionByConditionInfo(ConditionInfo conditionInfo, final Map<String, AttributeValue> expressionAttributeValues) {
         String valueLab;
+        String poundSignFieldName = POUND_SIGN.concat(conditionInfo.getFieldName().toLowerCase(Locale.ENGLISH));
         switch (conditionInfo.getOperator()) {
             case NULL:
-                return "attribute_not_exists(" + conditionInfo.getFieldName() + ")";
+                return "attribute_not_exists(" + poundSignFieldName + ")";
             case NOT_NULL:
-                return "attribute_exists(" + conditionInfo.getFieldName() + ")";
+                return "attribute_exists(" + poundSignFieldName + ")";
             case IN:
                 List<Object> values = conditionInfo.getFieldValues();
                 List<String> labels = new ArrayList<>(values.size());
@@ -355,31 +374,31 @@ public class DynamoDbClient {
                     labels.add(label);
                     appendExpressionAttributeValues(label, conditionInfo, values.get(index), expressionAttributeValues);
                 }
-                return conditionInfo.getFieldName() + IN + labels.stream().collect(Collectors.joining(IN_DELIMITER, IN_PREFIX, IN_SUFFIX));
+                return poundSignFieldName + IN + labels.stream().collect(Collectors.joining(IN_DELIMITER, IN_PREFIX, IN_SUFFIX));
             case EQ:
                 valueLab = buildValueLab(conditionInfo);
                 appendExpressionAttributeValues(valueLab, conditionInfo, conditionInfo.getFieldValue(), expressionAttributeValues);
-                return conditionInfo.getFieldName() + EQ + valueLab;
+                return poundSignFieldName + EQ + valueLab;
             case NE:
                 valueLab = buildValueLab(conditionInfo);
                 appendExpressionAttributeValues(valueLab, conditionInfo, conditionInfo.getFieldValue(), expressionAttributeValues);
-                return conditionInfo.getFieldName() + NE + valueLab;
+                return poundSignFieldName + NE + valueLab;
             case GT:
                 valueLab = buildValueLab(conditionInfo);
                 appendExpressionAttributeValues(valueLab, conditionInfo, conditionInfo.getFieldValue(), expressionAttributeValues);
-                return conditionInfo.getFieldName() + GT + valueLab;
+                return poundSignFieldName + GT + valueLab;
             case GE:
                 valueLab = buildValueLab(conditionInfo);
                 appendExpressionAttributeValues(valueLab, conditionInfo, conditionInfo.getFieldValue(), expressionAttributeValues);
-                return conditionInfo.getFieldName() + GE + valueLab;
+                return poundSignFieldName + GE + valueLab;
             case LE:
                 valueLab = buildValueLab(conditionInfo);
                 appendExpressionAttributeValues(valueLab, conditionInfo, conditionInfo.getFieldValue(), expressionAttributeValues);
-                return conditionInfo.getFieldName() + LE + valueLab;
+                return poundSignFieldName + LE + valueLab;
             case LT:
                 valueLab = buildValueLab(conditionInfo);
                 appendExpressionAttributeValues(valueLab, conditionInfo, conditionInfo.getFieldValue(), expressionAttributeValues);
-                return conditionInfo.getFieldName() + LT + valueLab;
+                return poundSignFieldName + LT + valueLab;
             default:
                 // TODO 添加更多的类型处理
                 throw new IllegalArgumentException(String.format("Not support %s operator in the filter expression.", conditionInfo.getOperator().name()));

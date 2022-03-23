@@ -146,7 +146,7 @@ public class DynamoDbRecordCursor implements RecordCursor {
                     }
                 }
             case BOOL:
-                return row.get(originName) == null ? null : row.get(originName).getBOOL().toString();
+                return row.get(originName) == null ? null : row.get(originName).getN();
             default:
                 throw new NotSupportedException(String.format("Not support for field [%s] with type [%s]  ", originName, type.name()));
         }
