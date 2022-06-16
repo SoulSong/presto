@@ -18,7 +18,10 @@ import com.amazonaws.services.dynamodbv2.AmazonDynamoDBClient;
 import com.amazonaws.services.dynamodbv2.datamodeling.DynamoDBMapper;
 import com.amazonaws.services.dynamodbv2.document.DynamoDB;
 import com.amazonaws.services.dynamodbv2.model.AttributeValue;
+import com.amazonaws.services.dynamodbv2.model.BatchGetItemRequest;
+import com.amazonaws.services.dynamodbv2.model.BatchGetItemResult;
 import com.amazonaws.services.dynamodbv2.model.ComparisonOperator;
+import com.amazonaws.services.dynamodbv2.model.KeysAndAttributes;
 import com.amazonaws.services.dynamodbv2.model.QueryRequest;
 import com.amazonaws.services.dynamodbv2.model.QueryResult;
 import com.amazonaws.services.dynamodbv2.model.ScanRequest;
@@ -38,14 +41,17 @@ import com.facebook.presto.spi.StandardErrorCode;
 import com.facebook.presto.spi.TableNotFoundException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
 import org.apache.commons.collections.CollectionUtils;
 
 import javax.inject.Inject;
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -171,18 +177,58 @@ public class DynamoDbClient {
             Set<DynamoDbColumn> desiredColumns = split.getDesiredColumns();
             DynamoDbTable table = tableMap.get(tableName);
 
+            // 没有任何过滤项，其主要应用于数据预览，返回行根据config配置约束
             if (CollectionUtils.isEmpty(conditionInfos)) {
                 ScanRequest scanRequest = buildScanRequest(table, desiredColumns);
                 return executeScan(scanRequest).iterator();
+            } else if (conditionInfos.size() == 1 && ComparisonOperator.IN.equals(conditionInfos.get(0).getOperator())) {
+                // 如果仅有一个in比较符
+                ConditionInfo conditionInfo = conditionInfos.get(0);
+                // 当前table的primaryIndex仅有唯一hashKey（无rangekey）,且in操作符对应的过滤项与之匹配，则走batchGet
+                // batchGet操作仅仅支持主表索引，不支持二级索引
+                if (table.getHashKeyName().equalsIgnoreCase(conditionInfo.getFieldName()) && table.getRangeKeyName() == null) {
+                    BatchGetItemResult result = dynamoDbClient.batchGetItem(buildBatchGetItemRequestWithHashKey(conditionInfo, tableName, desiredColumns));
+                    log.info("fetch result size is %s", result.getResponses().get(tableName).size());
+                    return result.getResponses().get(tableName).iterator();
+                } else {
+                    // 拆分当前in操作符为独立的等值查询，并在最终进行结果合并
+                    List<Map<String, AttributeValue>> result = new ArrayList<>();
+                    conditionInfo.getFieldValues().forEach(fieldValue -> {
+                        ConditionInfo targetConditionInfo = new ConditionInfo(conditionInfo.getFieldName(), true,
+                                fieldValue, null, conditionInfo.getDynamoDbAttributeType(), ComparisonOperator.EQ);
+                        QueryRequest queryRequest = buildQueryRequest(table, new ArrayList<>(Collections.singletonList(targetConditionInfo)), desiredColumns);
+                        result.addAll(executeQuery(queryRequest));
+                    });
+                    return result.iterator();
+                }
+            } else if (conditionInfos.size() == 2) {
+                Set<ComparisonOperator> comparisonOperators = new HashSet<>(2);
+                conditionInfos.forEach(conditionInfo -> comparisonOperators.add(conditionInfo.getOperator()));
+                // 如果当前过滤项中，正好包含一个等值一个in比较符，且其又对应了primaryIndex中的hashKey和rangeKey，则仍然可以通过batchGet获取数据
+                if (comparisonOperators.containsAll(ImmutableSet.of(ComparisonOperator.IN, ComparisonOperator.EQ)) && table.getRangeKeyName() != null) {
+                    ConditionInfo eqConditionInfo = conditionInfos.stream().filter(conditionInfo -> ComparisonOperator.EQ.equals(conditionInfo.getOperator())).findFirst().orElse(null);
+                    ConditionInfo inConditionInfo = conditionInfos.stream().filter(conditionInfo -> ComparisonOperator.IN.equals(conditionInfo.getOperator())).findFirst().orElse(null);
+                    Set<String> keyFieldNames = new HashSet<>(2);
+                    keyFieldNames.add(table.getHashKeyName().toLowerCase(Locale.ENGLISH));
+                    keyFieldNames.add(table.getRangeKeyName().toLowerCase(Locale.ENGLISH));
+                    if (eqConditionInfo != null && inConditionInfo != null
+                            && keyFieldNames.containsAll(ImmutableSet.of(eqConditionInfo.getFieldName().toLowerCase(Locale.ENGLISH),
+                            inConditionInfo.getFieldName().toLowerCase(Locale.ENGLISH)))) {
+                        BatchGetItemResult result = dynamoDbClient.batchGetItem(buildBatchGetItemRequestWithHashKeyAndRangeKey(eqConditionInfo, inConditionInfo, tableName, desiredColumns));
+                        log.info("fetch result size is %s", result.getResponses().get(tableName).size());
+                        return result.getResponses().get(tableName).iterator();
+                    }
+                }
             }
 
+            // 根据rbo规则尝试执行query
             QueryRequest queryRequest = buildQueryRequest(table, conditionInfos, desiredColumns);
             return executeQuery(queryRequest).iterator();
-
         }
 
         throw new NotSupportException("Not support scan table.");
     }
+
 
     private ScanRequest buildScanRequest(DynamoDbTable table, Set<DynamoDbColumn> desiredColumns) {
         // 构建projection
@@ -203,6 +249,106 @@ public class DynamoDbClient {
                             .collect(Collectors.joining(IN_DELIMITER)));
         }
         return scanRequest;
+    }
+
+    /**
+     * 基于主表hashKey构建{@link BatchGetItemRequest}。原生不支持index
+     *
+     * @param conditionInfo  conditionInfo
+     * @param tableName      tableName
+     * @param desiredColumns 所有应用字段，含投影字段
+     * @return BatchGetItemRequest
+     */
+    private BatchGetItemRequest buildBatchGetItemRequestWithHashKey(ConditionInfo conditionInfo, String tableName,
+                                                                    Set<DynamoDbColumn> desiredColumns) {
+        BatchGetItemRequest batchGetItemRequest = new BatchGetItemRequest();
+        // 处理保留关键字
+        Set<String> projections = desiredColumns.stream().map(DynamoDbColumn::getOriginName).collect(Collectors.toSet());
+        Map<String, String> expressionAttributeNames = new HashMap<>(projections.size());
+        projections.forEach(projection -> expressionAttributeNames.put(POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH)), projection));
+
+        String fieldName = conditionInfo.getFieldName();
+
+        KeysAndAttributes keysAndAttributes = new KeysAndAttributes();
+        List<Map<String, AttributeValue>> keys = new ArrayList<>();
+        switch (conditionInfo.getDynamoDbAttributeType()) {
+            case N:
+                conditionInfo.getFieldValues().forEach(value -> {
+                    keys.add(ImmutableMap.of(fieldName, new AttributeValue().withN(value.toString())));
+                });
+                break;
+            case S:
+                conditionInfo.getFieldValues().forEach(value -> {
+                    keys.add(ImmutableMap.of(fieldName, new AttributeValue().withS(value.toString())));
+                });
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("HashKey and rangeKey only support N or S type, not support %s. filedName is %s",
+                        conditionInfo.getDynamoDbAttributeType().name(), conditionInfo.getFieldName()));
+        }
+        keysAndAttributes.withKeys(keys);
+
+        keysAndAttributes.withProjectionExpression(projections.stream().map(projection -> POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH))).collect(Collectors.joining(IN_DELIMITER)))
+                .withExpressionAttributeNames(expressionAttributeNames);
+        batchGetItemRequest.withRequestItems(ImmutableMap.of(tableName, keysAndAttributes));
+        return batchGetItemRequest;
+    }
+
+    /**
+     * 基于主表hashKey和rangeKey构建{@link BatchGetItemRequest}。原生不支持index
+     *
+     * @param eqConditionInfo eqConditionInfo
+     * @param inConditionInfo inConditionInfo
+     * @param tableName       tableName
+     * @param desiredColumns  所有应用字段，含投影字段
+     * @return BatchGetItemRequest
+     */
+    private BatchGetItemRequest buildBatchGetItemRequestWithHashKeyAndRangeKey(ConditionInfo eqConditionInfo, ConditionInfo inConditionInfo,
+                                                                               String tableName, Set<DynamoDbColumn> desiredColumns) {
+        BatchGetItemRequest batchGetItemRequest = new BatchGetItemRequest();
+        // 处理保留关键字
+        Set<String> projections = desiredColumns.stream().map(DynamoDbColumn::getOriginName).collect(Collectors.toSet());
+        Map<String, String> expressionAttributeNames = new HashMap<>(projections.size());
+        projections.forEach(projection -> expressionAttributeNames.put(POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH)), projection));
+
+        String inFieldName = inConditionInfo.getFieldName();
+
+        KeysAndAttributes keysAndAttributes = new KeysAndAttributes();
+        List<Map<String, AttributeValue>> keys = new ArrayList<>();
+        final AttributeValue eqConditionValue = new AttributeValue();
+        switch (eqConditionInfo.getDynamoDbAttributeType()) {
+            case N:
+                eqConditionValue.withN(eqConditionInfo.getFieldValue().toString());
+                break;
+            case S:
+                eqConditionValue.withS(eqConditionInfo.getFieldValue().toString());
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("HashKey and rangeKey only support N or S type, not support %s. filedName is %s",
+                        inConditionInfo.getDynamoDbAttributeType().name(), inConditionInfo.getFieldName()));
+        }
+
+        switch (inConditionInfo.getDynamoDbAttributeType()) {
+            case N:
+                inConditionInfo.getFieldValues().forEach(value -> {
+                    keys.add(ImmutableMap.of(eqConditionInfo.getFieldName(), eqConditionValue, inFieldName, new AttributeValue().withN(value.toString())));
+                });
+                break;
+            case S:
+                inConditionInfo.getFieldValues().forEach(value -> {
+                    keys.add(ImmutableMap.of(eqConditionInfo.getFieldName(), eqConditionValue, inFieldName, new AttributeValue().withS(value.toString())));
+                });
+                break;
+            default:
+                throw new IllegalArgumentException(String.format("HashKey and rangeKey only support N or S type, not support %s. filedName is %s",
+                        inConditionInfo.getDynamoDbAttributeType().name(), inConditionInfo.getFieldName()));
+        }
+        keysAndAttributes.withKeys(keys);
+
+        keysAndAttributes.withProjectionExpression(projections.stream().map(projection -> POUND_SIGN.concat(projection.toLowerCase(Locale.ENGLISH))).collect(Collectors.joining(IN_DELIMITER)))
+                .withExpressionAttributeNames(expressionAttributeNames);
+        batchGetItemRequest.withRequestItems(ImmutableMap.of(tableName, keysAndAttributes));
+        return batchGetItemRequest;
     }
 
 
@@ -452,6 +598,7 @@ public class DynamoDbClient {
 
             queryRequest.withExclusiveStartKey(result.getLastEvaluatedKey());
         } while (queryRequest.getExclusiveStartKey() != null);
+        log.info("ExecuteQuery fetch result size is %s", values.size());
         return values;
     }
 

@@ -116,6 +116,11 @@ public class DynamoDbRecordCursor implements RecordCursor {
                     return null;
                 } else {
                     Map<String, Object> mapValue = ItemUtils.toSimpleMapValue(row);
+                    // todo 兼容dynamodb中NULL类型，目前方案不是很优雅
+                    if(null == mapValue.get(originName)){
+                        return null;
+                    }
+
                     return mapValue.get(originName).toString();
                 }
             case L:
