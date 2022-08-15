@@ -221,9 +221,39 @@ public class DynamoDbClient {
                 }
             }
 
-            // 根据rbo规则尝试执行query
-            QueryRequest queryRequest = buildQueryRequest(table, conditionInfos, desiredColumns);
-            return executeQuery(queryRequest).iterator();
+            // 根据rbo规则尝试执行query，如果当前查询无法被支持，则可考虑拆分其中的in查询子项，扩展查询能力
+            try {
+                QueryRequest queryRequest = buildQueryRequest(table, conditionInfos, desiredColumns);
+                return executeQuery(queryRequest).iterator();
+            } catch (NotSupportException e) {
+                // 判断当前所有的过滤项中存在in比较符，对其进行拆分构建独立 QueryRequest 后合并结果
+                List<ConditionInfo> inConditionInfos = conditionInfos.stream()
+                        .filter(conditionInfo -> ComparisonOperator.IN.equals(conditionInfo.getOperator())).collect(Collectors.toList());
+                if (CollectionUtils.isNotEmpty(inConditionInfos)) {
+                    List<Map<String, AttributeValue>> result = new ArrayList<>();
+                    // 拆分当前 inFilter，如果可执行则累加结果；反之，遍历拆分下一个inFilter
+                    for (ConditionInfo inConditionInfo : inConditionInfos) {
+                        for (Object fieldValue : inConditionInfo.getFieldValues()) {
+                            List<ConditionInfo> newConditionInfos = new ArrayList<>(conditionInfos);
+                            newConditionInfos.remove(inConditionInfo);
+                            ConditionInfo targetEqConditionInfo = new ConditionInfo(inConditionInfo.getFieldName(), true,
+                                    fieldValue, null, inConditionInfo.getDynamoDbAttributeType(), ComparisonOperator.EQ);
+                            newConditionInfos.add(targetEqConditionInfo);
+                            try {
+                                QueryRequest queryRequest = buildQueryRequest(table, newConditionInfos, desiredColumns);
+                                result.addAll(executeQuery(queryRequest));
+                            } catch (NotSupportException notSupportException) {
+                                break;
+                            }
+                        }
+                        if (CollectionUtils.isNotEmpty(result)) {
+                            break;
+                        }
+                    }
+                    return result.iterator();
+                }
+                throw e;
+            }
         }
 
         throw new NotSupportException("Not support scan table.");
